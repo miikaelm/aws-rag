@@ -25,8 +25,22 @@ def display_sections(url_id: int, base_url: str):
 def settings_page():
     st.title("RAG Settings")
     init_db()
-    
-      # Add new URL section
+
+    if 'content_warnings' in st.session_state and st.session_state.content_warnings:
+        with st.expander("⚠️ Content Size Warnings", expanded=True):
+            for warning in st.session_state.content_warnings:
+                if warning['level'] == 'high':
+                    st.warning(warning['message'])
+                elif warning['level'] == 'medium':
+                    st.warning(warning['message'])
+                elif warning['level'] == 'low':
+                    st.info(warning['message'])
+            
+            if st.button("Clear Warnings"):
+                st.session_state.content_warnings = []
+                st.rerun()
+
+    # Add new URL section
     st.header("Add New Documentation URL")
     with st.form("add_url_form"):
         new_url = st.text_input("URL", placeholder="https://docs.aws.amazon.com/...")
@@ -66,12 +80,19 @@ def settings_page():
                 with col1:
                     if st.button(f"Scrape", key=f"scrape_{url_id}"):
                         with st.spinner(f"Scraping {url}..."):
-                            result = scrape_url(url)
-                            if result:
+                            try:    
+                                result = scrape_url(url)
+
+                                if result is None:
+                                    st.error(f"Error during scraping process {url}: {str(e)}")
+                                    return
+
                                 title, sections = result
                                 if save_scraped_content(url_id, title, sections):
                                     st.success("Content scraped and saved successfully!")
                                     st.rerun()
+                            except Exception as e:
+                                st.error(f"Error during scraping process: {str(e)}")
                 
                 with col2:
                     if st.button(f"Delete", key=f"del_{url_id}"):

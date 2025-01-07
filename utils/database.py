@@ -119,11 +119,12 @@ def extract_sections(soup, base_url: str) -> List[Section]:
             current_element = current_element.find_next_sibling()
         
         content = '\n'.join(content_elements)
+        header_text = header.get_text(strip=True)
         
-        handle_content_length_warning(content)
+        handle_content_length_warning(content, header_text)
         # Create new section
         new_section = Section(
-            title=header.get_text(strip=True),
+            title=header_text,
             content=content,
             level=level,
             url_fragment=url_fragment,
@@ -143,18 +144,31 @@ def extract_sections(soup, base_url: str) -> List[Section]:
 
     return sections
 
-def handle_content_length_warning(content: str):
+def handle_content_length_warning(content: str, title: str):
     
     WARNING_THRESHOLD = 1700  # Current max
     MEDIUM_THRESHOLD = 2500   # Getting large
     LARGE_THRESHOLD = 4000    # Needs attention
-
-    if len(content) > LARGE_THRESHOLD:
-        st.warning("This content is very large and may not be processed correctly. Please consider breaking it down into smaller chunks.")
-    elif len(content) > MEDIUM_THRESHOLD:
-        st.warning("This content is large and may not be processed correctly. Please consider breaking it down into smaller chunks.")
-    elif len(content) > WARNING_THRESHOLD:
-        st.warning("This content is getting close to the limit and may not be processed correctly. Please consider breaking it down into smaller chunks.")
+    # Initialize warnings list in session state if it doesn't exist
+    if 'content_warnings' not in st.session_state:
+        st.session_state.content_warnings = []
+    
+    content_length = len(content)
+    if content_length > LARGE_THRESHOLD:
+        st.session_state.content_warnings.append({
+            'level': 'high',
+            'message': f"🚨 Section '{title}' is very large ({content_length} chars) and may need chunking"
+        })
+    elif content_length > MEDIUM_THRESHOLD:
+        st.session_state.content_warnings.append({
+            'level': 'medium',
+            'message': f"⚠️ Section '{title}' is large ({content_length} chars) and may need chunking"
+        })
+    elif content_length > WARNING_THRESHOLD:
+        st.session_state.content_warnings.append({
+            'level': 'low',
+            'message': f"ℹ️ Section '{title}' is approaching size limit ({content_length} chars)"
+        })
 
 def save_section(cursor, url_id: int, section: Section, parent_id: Optional[int] = None, order: int = 0):
     """Recursively save a section and its subsections to the database"""
@@ -179,10 +193,11 @@ def scrape_url(url: str) -> Optional[tuple[str, List[Section]]]:
         # Remove script and style elements
         for script in soup(['script', 'style']):
             script.decompose()
-            
+
         # Extract title
         title = soup.title.string if soup.title else url
         
+        st.write(title)
         # Extract hierarchical sections
         sections = extract_sections(soup, url)
         
