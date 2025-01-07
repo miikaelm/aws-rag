@@ -6,7 +6,9 @@ st.set_page_config(
     layout="wide"
 )
 
-from utils.database import init_db, scrape_url, save_scraped_content, get_urls, get_content, add_url, delete_url, get_sections
+from utils.database import init_db, scrape_url, save_scraped_content,get_urls, get_content, add_url, delete_url, get_sections
+from utils.vector_store import VectorStore
+from utils.text_processing import prepare_sections_for_indexing
 
 def display_sections(url_id: int, base_url: str):
     """Display hierarchical content with expandable sections"""
@@ -75,6 +77,9 @@ def settings_page():
                 else:
                     st.write("**Status:** Not yet scraped")
                 
+                # Initialize vector store
+                vector_store = VectorStore()
+                
                 # Scrape and Delete buttons
                 col1, col2 = st.columns(2)
                 with col1:
@@ -82,21 +87,35 @@ def settings_page():
                         with st.spinner(f"Scraping {url}..."):
                             try:    
                                 result = scrape_url(url)
-
                                 if result is None:
-                                    st.error(f"Error during scraping process {url}: {str(e)}")
+                                    st.error("Error during scraping process")
                                     return
 
                                 title, sections = result
-                                if save_scraped_content(url_id, title, sections):
-                                    st.success("Content scraped and saved successfully!")
-                                    st.rerun()
+                                if save_scraped_content(url_id, title, sections):                                    
+                                    # Get saved sections
+                                    saved_sections = get_sections(url_id)
+                                    
+                                    # Process sections for vector store
+                                    documents = prepare_sections_for_indexing(saved_sections, url)
+                                    
+                                    # Add to vector store
+                                    if vector_store.add_section_chunks(documents, url_id):
+                                        st.success("Content scraped and indexed successfully!")
+                                        
+                                        # Show some stats
+                                        stats = vector_store.get_stats()
+                                        st.info(f"Vector store now contains {stats['total_chunks']} chunks")
+                                        
+                                        st.rerun()
+                                    else:
+                                        st.error("Error adding content to vector store")
                             except Exception as e:
-                                st.error(f"Error during scraping process: {str(e)}")
-                
+                                st.error(f"Error during scraping process: {str(e)}")           
                 with col2:
                     if st.button(f"Delete", key=f"del_{url_id}"):
                         delete_url(url_id)
+                        vector_store.delete_url_content(url_id)
                         st.rerun()
 
 if __name__ == "__main__":
