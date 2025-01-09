@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from utils.vector_store import VectorStore
 from utils.rag import RAGPipeline
 from utils.logger import Logger
+from utils.database import get_database
 
 # Type definitions for better type safety
 @dataclass
@@ -15,24 +16,27 @@ class Message:
     sources: Optional[str] = None
     confidence: Optional[float] = None
 
+def initialize_components():
+    """Initialize all necessary components"""
+    # Get database instance
+    get_database()
+    
+    # Initialize other components
+    if 'vector_store' not in st.session_state:
+        st.session_state.vector_store = VectorStore()
+    
+    if 'rag_pipeline' not in st.session_state:
+        st.session_state.rag_pipeline = RAGPipeline(st.session_state.vector_store)
+    
+    if 'chat_history' not in st.session_state:
+        st.session_state.chat_history = []
+        
+    if 'processing' not in st.session_state:
+        st.session_state.processing = False
+
 class ChatInterface:
     def __init__(self):
         self.logger = Logger()
-        self._initialize_session_state()
-        
-    def _initialize_session_state(self):
-        """Initialize all session state variables"""
-        if 'vector_store' not in st.session_state:
-            st.session_state.vector_store = VectorStore()
-        
-        if 'rag_pipeline' not in st.session_state:
-            st.session_state.rag_pipeline = RAGPipeline(st.session_state.vector_store)
-        
-        if 'chat_history' not in st.session_state:
-            st.session_state.chat_history: List[Message] = []
-        
-        if 'processing' not in st.session_state:
-            st.session_state.processing = False
 
     @asynccontextmanager
     async def _processing_state(self):
@@ -104,7 +108,7 @@ def main():
         page_icon="📚",
         layout="wide"
     )
-    
+    initialize_components()
     chat = ChatInterface()
     
     st.title("AWS Documentation Assistant")
