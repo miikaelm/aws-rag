@@ -8,6 +8,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI, HarmCategory, HarmBlo
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 import os
 import hashlib
+import re
 
 @dataclass
 class RAGResponse:
@@ -55,19 +56,49 @@ class RAGPipeline:
                     content="""You are an AWS documentation assistant. Your role is to provide accurate, 
                     helpful answers about AWS services and features based on the provided documentation context.
                     Only answer based on the provided context. If the context doesn't contain enough information,
-                    say so. Include code examples when available and cite sources using [Title] notation.""",
+                    say so. 
+                    
+                    When referring to documentation, use the exact format [[Title](URL)] for citations, where Title
+                    and URL match those provided in the context. Always include at least one citation per statement.""",
                     chunk_hashes=set()
                 )
             ]
         if 'used_chunks' not in st.session_state:
             st.session_state.used_chunks = set()
 
+    def _create_source_map(self, chunks: List[Dict]) -> Dict[str, str]:
+        """Create a mapping of titles to URLs for source linking"""
+        source_map = {}
+        for chunk in chunks:
+            metadata = chunk['metadata']
+            title = metadata.get('title', 'Unknown Section')
+            url = metadata.get('url', '')
+            if url and title:
+                source_map[title] = url
+        return source_map
+    
     def _hash_chunk(self, chunk: Dict) -> str:
         """Create a unique hash for a chunk based on its content and metadata"""
         content = chunk['content']
         metadata = str(sorted(chunk['metadata'].items()))  # Convert metadata to stable string
         return hashlib.md5(f"{content}{metadata}".encode()).hexdigest()
 
+    def _process_response(self, response: str, source_map: Dict[str, str]) -> str:
+        """Process the response to ensure proper markdown formatting of references"""
+        # Replace any existing markdown-style links that might be malformed
+        response = re.sub(r'\[([^\]]+)\]\((?:[^\)]+)?\)', r'[\1]', response)
+        
+        # Replace references with proper markdown links
+        for title, url in source_map.items():
+            # Look for titles in square brackets without links
+            response = re.sub(
+                f'\\[{re.escape(title)}\\](?!\\()',
+                f'[{title}]({url})',
+                response
+            )
+        
+        return response
+    
     def _filter_new_chunks(self, chunks: List[Dict]) -> List[Dict]:
         """Filter out chunks that have been used in previous context"""
         new_chunks = []
@@ -140,18 +171,19 @@ class RAGPipeline:
                 ])
                 return no_context_response
             
+            # Create source map for link formatting
+            source_map = self._create_source_map(all_chunks)
+            
             # Format context, including only new chunks
-            context = self.format_context(new_chunks) if new_chunks else ""
-            
-            if not context:
-                context = "Using previously provided context."
-            
+            context = self.format_context(new_chunks) if new_chunks else "Using previously provided context."
+
             # Create the contextual question
             contextual_question = f"""Context information is below:
             ---------------
             {context}
             ---------------
             Question: {question}
+            Remember to use the exact format [[Title](URL)] for all references, where Title and URL match those in the context.
             Note: Context shown is additional to previously provided information."""
             
             # Convert history to LangChain format
@@ -164,6 +196,9 @@ class RAGPipeline:
             # Get response from LLM
             response = await self._llm.ainvoke(llm_messages)
             
+            # Process response to ensure proper link formatting
+            processed_response = self._process_response(response.content, source_map)
+            
             # Calculate confidence based on all relevant chunks
             avg_relevance = sum(chunk.get('relevance', 0) for chunk in all_chunks) / len(all_chunks)
             
@@ -175,7 +210,7 @@ class RAGPipeline:
             
             # Create RAG response
             rag_response = RAGResponse(
-                answer=response.content,
+                answer=processed_response,
                 sources=all_chunks,
                 confidence=avg_relevance
             )
@@ -185,7 +220,7 @@ class RAGPipeline:
                 Message(role="user", content=question),
                 Message(
                     role="assistant",
-                    content=response.content,
+                    content=processed_response,
                     sources=sources_text,
                     confidence=avg_relevance,
                     chunk_hashes=current_chunk_hashes
