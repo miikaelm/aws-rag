@@ -8,7 +8,6 @@ from utils.rag import RAGPipeline
 from utils.logger import Logger
 from utils.database import get_database
 
-# Type definitions for better type safety
 @dataclass
 class Message:
     role: str
@@ -28,11 +27,20 @@ def initialize_components():
     if 'rag_pipeline' not in st.session_state:
         st.session_state.rag_pipeline = RAGPipeline(st.session_state.vector_store)
     
-    if 'chat_history' not in st.session_state:
-        st.session_state.chat_history = []
+    # Initialize messages list if not present (RAG pipeline will add system message)
+    if 'messages' not in st.session_state:
+        st.session_state.messages = []
         
     if 'processing' not in st.session_state:
         st.session_state.processing = False
+
+def get_or_create_eventloop():
+    """Get the current event loop or create a new one"""
+    if 'event_loop' not in st.session_state:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        st.session_state.event_loop = loop
+    return st.session_state.event_loop
 
 class ChatInterface:
     def __init__(self):
@@ -49,9 +57,17 @@ class ChatInterface:
 
     def _display_message(self, message: Message):
         """Display a single chat message with proper formatting"""
+        # Skip system messages in display
+        if message.role == "system":
+            return
+            
+        # Display user messages
         if message.role == "user":
-            st.write("You:", message.content)
-        else:
+            with st.chat_message("user"):
+                st.write(message.content)
+                
+        # Display assistant messages with sources and confidence
+        elif message.role == "assistant":
             with st.chat_message("assistant"):
                 st.write(message.content)
                 if message.sources:
@@ -64,8 +80,9 @@ class ChatInterface:
 
     def display_chat_history(self):
         """Display the entire chat history"""
-        self.logger.info(f"Displaying chat history with {len(st.session_state.chat_history)} messages")
-        for message in st.session_state.chat_history:
+        self.logger.info(f"Displaying chat history with {len(st.session_state.messages)} messages")
+        # Display all messages except the system message
+        for message in st.session_state.messages:
             self._display_message(message)
 
     async def process_question(self, question: str):
@@ -75,32 +92,11 @@ class ChatInterface:
                 # Get response from RAG pipeline
                 response = await st.session_state.rag_pipeline.get_answer(question)
                 
-                # Format source references
-                sources_text = st.session_state.rag_pipeline.format_sources(response.sources)
-                
-                # Add messages to chat history
-                st.session_state.chat_history.extend([
-                    Message(role="user", content=question),
-                    Message(
-                        role="assistant",
-                        content=response.answer,
-                        sources=sources_text,
-                        confidence=response.confidence
-                    )
-                ])
+                # No need to manually add to history - RAG pipeline handles it
                 
             except Exception as e:
                 self.logger.error(f"Error processing question: {str(e)}")
                 st.error("I encountered an error while processing your question. Please try again.")
-                
-                # Add error message to chat history
-                st.session_state.chat_history.extend([
-                    Message(role="user", content=question),
-                    Message(
-                        role="assistant",
-                        content="I apologize, but I encountered an error while processing your question. Please try again."
-                    )
-                ])
 
 def main():
     st.set_page_config(
@@ -141,7 +137,8 @@ def main():
                     
                     # Process the question
                     with st.spinner("Searching documentation..."):
-                        asyncio.run(chat.process_question(question))
+                        loop = get_or_create_eventloop()
+                        loop.run_until_complete(chat.process_question(question))
         
         # User input - disabled during processing
         st.text_input(
@@ -154,8 +151,9 @@ def main():
         # Add clear chat button
         col1, col2 = st.columns([6, 1])
         with col2:
-            if st.session_state.chat_history and st.button("Clear Chat", type="secondary"):
-                st.session_state.chat_history = []
+            if len(st.session_state.messages) > 1 and st.button("Clear Chat", type="secondary"):
+                # Clear all messages except system message
+                st.session_state.messages = [st.session_state.messages[0]]
                 st.rerun()
 
 if __name__ == "__main__":
