@@ -4,6 +4,9 @@ from datetime import datetime
 from dataclasses import dataclass
 from utils.vector_store import VectorStore, Document
 from utils.logger import Logger
+from langchain_google_genai import ChatGoogleGenerativeAI, HarmCategory, HarmBlockThreshold
+from langchain_core.messages import SystemMessage, HumanMessage
+import os
 
 @dataclass
 class RAGResponse:
@@ -11,6 +14,35 @@ class RAGResponse:
     answer: str
     sources: List[Dict]  # List of source chunks with metadata
     confidence: float    # Overall confidence score (0-1)
+
+def init_gemini_llm(api_key: Optional[str] = None) -> ChatGoogleGenerativeAI:
+    """
+    Initialize Google Gemini LLM with LangChain
+    
+    Args:
+        api_key: Optional API key, will use environment variable if not provided
+        
+    Returns:
+        Configured ChatGoogleGenerativeAI instance
+    """
+    api_key = api_key or os.getenv("GOOGLE_API_KEY")
+    logger = Logger()
+    logger.info(f"GOOGLE_API_KEY: {api_key}")
+    if not api_key:
+        raise ValueError("GOOGLE_API_KEY must be provided or set in environment")
+        
+    return ChatGoogleGenerativeAI(
+        model="gemini-1.5-pro",
+        google_api_key=api_key,
+        temperature=0.7,
+        top_p=0.95,
+        top_k=40,
+        max_output_tokens=2048,
+        safety_settings={
+            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+        },
+    )
+
 
 class RAGPipeline:
     def __init__(self, vector_store: VectorStore):
@@ -21,6 +53,7 @@ class RAGPipeline:
             vector_store: Initialized VectorStore instance
         """
         self.vector_store = vector_store
+        self.logger = Logger()
         
         # Default system prompt template
         self.system_prompt = """You are an AWS documentation assistant. Your role is to provide accurate, 
@@ -88,8 +121,7 @@ class RAGPipeline:
             min_relevance: Minimum relevance score for chunks
             max_chunks: Maximum number of chunks to include
         """
-        logger = Logger()
-        logger.info(f"Question: {question}")
+        self.logger.info(f"Question: {question}")
         try:
             # 1. Retrieve relevant chunks
             chunks = self.vector_store.search_similar(
@@ -100,7 +132,7 @@ class RAGPipeline:
             )
             
 
-            logger.info(f"Chunks: {chunks}")
+            self.logger.info(f"Chunks: {chunks}")
             
             if not chunks:
                 return RAGResponse(
@@ -113,8 +145,6 @@ class RAGPipeline:
             prompt = self.generate_prompt(question, chunks)
             
             # 3. Get response from LLM
-            # Note: You'll need to implement LLM integration based on your chosen provider
-            # This is a placeholder for the LLM call
             response = await self._get_llm_response(prompt)
             
             # 4. Calculate confidence based on chunk relevance
@@ -127,6 +157,7 @@ class RAGPipeline:
             )
             
         except Exception as e:
+            self.logger.error(f"Error in RAG pipeline: {str(e)}")
             st.error(f"Error in RAG pipeline: {str(e)}")
             return RAGResponse(
                 answer="Sorry, I encountered an error while processing your question.",
@@ -136,26 +167,32 @@ class RAGPipeline:
 
     async def _get_llm_response(self, prompt: str) -> str:
         """
-        Get response from LLM
+        Get response from Gemini LLM using LangChain
         
         Args:
             prompt: Complete prompt for LLM
             
-        Note: This is a placeholder. Implement with your chosen LLM provider.
+        Returns:
+            Generated response text
         """
-        # TODO: Implement LLM integration
-        # For example, using OpenAI:
-        # response = await openai.ChatCompletion.create(
-        #     model="gpt-3.5-turbo",
-        #     messages=[
-        #         {"role": "system", "content": self.system_prompt},
-        #         {"role": "user", "content": prompt}
-        #     ]
-        # )
-        # return response.choices[0].message.content
-        
-        # Placeholder response
-        return "LLM integration not implemented yet. Response would be generated here."
+        try:
+            # Initialize LLM if not already done
+            if not hasattr(self, '_llm'):
+                self._llm = init_gemini_llm()
+            
+            # Create message list with system and user prompts
+            messages = [
+                SystemMessage(content=self.system_prompt),
+                HumanMessage(content=prompt)
+            ]
+            
+            # Get response from LLM
+            response = await self._llm.ainvoke(messages)
+            return response.content
+            
+        except Exception as e:
+            self.logger.error(f"Error getting LLM response: {str(e)}")
+            return f"Error generating response: {str(e)}"
 
     def format_sources(self, sources: List[Dict]) -> str:
         """
