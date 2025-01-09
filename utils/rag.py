@@ -150,16 +150,17 @@ class RAGPipeline:
         """Convert our LLMHistoryItem objects to LangChain message format"""
         langchain_messages = []
         for item in history:
-            content = item.content
-            if item.context:  # Add context if it exists
-                content = f"Context:\n{item.context}\n\nMessage:\n{content}"
-                
             if item.role == "system":
-                langchain_messages.append(SystemMessage(content=content))
+                langchain_messages.append(SystemMessage(content=item.content))
             elif item.role == "user":
+                # For user messages, include context if it exists
+                content = item.content
+                if item.context:
+                    content = f"Context:\n{item.context}\n\nQuestion:\n{content}"
                 langchain_messages.append(HumanMessage(content=content))
             elif item.role == "assistant":
-                langchain_messages.append(AIMessage(content=content))
+                # For assistant messages, just use their response
+                langchain_messages.append(AIMessage(content=item.content))
         return langchain_messages
 
     async def get_answer(
@@ -214,8 +215,7 @@ class RAGPipeline:
             st.session_state.llm_history.append(
                 LLMHistoryItem(
                     role="assistant",
-                    content=processed_response,
-                    context=context
+                    content=processed_response
                 )
             )
             
