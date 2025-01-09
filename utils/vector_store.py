@@ -6,6 +6,7 @@ import chromadb
 from chromadb.utils import embedding_functions
 import streamlit as st
 from datetime import datetime
+from utils.logger import Logger
 
 @dataclass
 class Document:
@@ -65,6 +66,9 @@ class VectorStore:
                 }
                 for chunk in chunks
             ]
+            
+            logger = Logger()
+            logger.info(f"Adding {len(chunks)} chunks to vector store for URL ID {url_id}")
             
             # Add chunks to collection
             self.collection.upsert(

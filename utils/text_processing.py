@@ -83,13 +83,13 @@ def process_section_content(
     for i, chunk in enumerate(content_chunks):
         # Prepare metadata
         metadata = {
-            'title': section['title'],
-            'section_id': section['id'],
-            'level': section['level'],
-            'path': section['path'],
-            'url': f"{url}#{section['url_fragment']}",
-            'chunk_index': i,
-            'total_chunks': len(content_chunks)
+            'title': str(section['title']),
+            'section_id': str(section['id']),
+            'level': str(section['level']),
+            'path': str(section['path']),
+            'url': str(f"{url}#{section['url_fragment']}"),
+            'chunk_index': str(i),
+            'total_chunks': str(len(content_chunks))
         }
         
         # Create document

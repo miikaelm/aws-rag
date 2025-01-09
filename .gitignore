@@ -1,1 +1,4 @@
 *.pyc
+rag_settings.db
+chroma_db/
+*.log
