@@ -4,16 +4,9 @@ from dataclasses import dataclass
 import asyncio
 from contextlib import asynccontextmanager
 from utils.vector_store import VectorStore
-from utils.rag import RAGPipeline
+from utils.rag import RAGPipeline, UIMessage
 from utils.logger import Logger
 from utils.database import get_database
-
-@dataclass
-class Message:
-    role: str
-    content: str
-    sources: Optional[str] = None
-    confidence: Optional[float] = None
 
 def initialize_components():
     """Initialize all necessary components"""
@@ -26,10 +19,6 @@ def initialize_components():
     
     if 'rag_pipeline' not in st.session_state:
         st.session_state.rag_pipeline = RAGPipeline(st.session_state.vector_store)
-    
-    # Initialize messages list if not present (RAG pipeline will add system message)
-    if 'messages' not in st.session_state:
-        st.session_state.messages = []
         
     if 'processing' not in st.session_state:
         st.session_state.processing = False
@@ -55,12 +44,8 @@ class ChatInterface:
         finally:
             st.session_state.processing = False
 
-    def _display_message(self, message: Message):
+    def _display_message(self, message: UIMessage):
         """Display a single chat message with proper formatting"""
-        # Skip system messages in display
-        if message.role == "system":
-            return
-            
         # Display user messages
         if message.role == "user":
             with st.chat_message("user"):
@@ -80,9 +65,9 @@ class ChatInterface:
 
     def display_chat_history(self):
         """Display the entire chat history"""
-        self.logger.info(f"Displaying chat history with {len(st.session_state.messages)} messages")
-        # Display all messages except the system message
-        for message in st.session_state.messages:
+        self.logger.info(f"Displaying chat history with {len(st.session_state.ui_messages)} messages")
+        # Display all UI messages
+        for message in st.session_state.ui_messages:
             self._display_message(message)
 
     async def process_question(self, question: str):
@@ -90,9 +75,8 @@ class ChatInterface:
         async with self._processing_state():
             try:
                 # Get response from RAG pipeline
+                # Note: RAG pipeline now handles adding messages to both histories
                 response = await st.session_state.rag_pipeline.get_answer(question)
-                
-                # No need to manually add to history - RAG pipeline handles it
                 
             except Exception as e:
                 self.logger.error(f"Error processing question: {str(e)}")
@@ -151,9 +135,9 @@ def main():
         # Add clear chat button
         col1, col2 = st.columns([6, 1])
         with col2:
-            if len(st.session_state.messages) > 1 and st.button("Clear Chat", type="secondary"):
-                # Clear all messages except system message
-                st.session_state.messages = [st.session_state.messages[0]]
+            if len(st.session_state.ui_messages) > 0 and st.button("Clear Chat", type="secondary"):
+                # Clear both histories through RAG pipeline
+                st.session_state.rag_pipeline.clear_history()
                 st.rerun()
 
 if __name__ == "__main__":
