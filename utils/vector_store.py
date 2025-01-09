@@ -87,8 +87,8 @@ class VectorStore:
         self,
         query: str,
         url_id: Optional[int] = None,
-        n_results: int = 5,
-        min_relevance: float = 0.0
+        n_results: int = 10,  # Increased from 5
+        min_relevance: float = 0.6  # Increased from 0.0
     ) -> List[Dict]:
         """
         Search for similar content chunks
@@ -103,25 +103,34 @@ class VectorStore:
             # Prepare where clause if url_id provided
             where = {"url_id": str(url_id)} if url_id is not None else None
             
-            # Query collection
+            # Query collection with increased n_results to account for filtering
             results = self.collection.query(
                 query_texts=[query],
-                n_results=n_results,
+                n_results=n_results * 2,  # Get more results initially
                 where=where,
                 include=["documents", "metadatas", "distances"]
             )
             
-            # Format results
+            # Format results with better relevance scoring
             documents = []
-            if results['ids'] and results['ids'][0]:  # Check if we have results
+            if results['ids'] and results['ids'][0]:
                 for i in range(len(results['ids'][0])):
-                    # Calculate relevance score (1 - normalized distance)
-                    distance = results['distances'][0][i] if 'distances' in results else 0
-                    relevance = 1 - (distance / 2)  # Convert distance to 0-1 score
+                    # Calculate relevance score with improved scaling
+                    distance = results['distances'][0][i]
+                    # Sigmoid-like transformation for better relevance distribution
+                    relevance = 1 / (1 + np.exp(distance * 2 - 1))
                     
                     # Skip if below minimum relevance
                     if relevance < min_relevance:
                         continue
+                        
+                    # Get token count if available
+                    token_count = int(results['metadatas'][0][i].get('token_count', '0'))
+                    
+                    # Boost relevance for larger chunks (more context)
+                    if token_count > 0:
+                        size_boost = min(token_count / 512, 1.2)  # Max 20% boost
+                        relevance *= size_boost
                     
                     documents.append({
                         'id': results['ids'][0][i],
@@ -130,11 +139,14 @@ class VectorStore:
                         'relevance': relevance
                     })
             
-            return documents
+            # Sort by relevance and limit to n_results
+            documents.sort(key=lambda x: x['relevance'], reverse=True)
+            return documents[:n_results]
             
         except Exception as e:
             st.error(f"Error searching vector store: {str(e)}")
             return []
+
 
     def delete_url_content(self, url_id: int) -> bool:
         """Delete all content chunks for a URL"""

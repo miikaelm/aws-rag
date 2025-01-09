@@ -1,4 +1,4 @@
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Set
 import streamlit as st
 from datetime import datetime
 from dataclasses import dataclass
@@ -7,6 +7,7 @@ from utils.logger import Logger
 from langchain_google_genai import ChatGoogleGenerativeAI, HarmCategory, HarmBlockThreshold
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 import os
+import hashlib
 
 @dataclass
 class RAGResponse:
@@ -22,6 +23,7 @@ class Message:
     content: str
     sources: Optional[str] = None
     confidence: Optional[float] = None
+    chunk_hashes: Optional[Set[str]] = None  # Store hashes of chunks used
     
 class RAGPipeline:
     def __init__(self, vector_store: VectorStore):
@@ -45,7 +47,7 @@ class RAGPipeline:
             },
         )
         
-        # Initialize messages in session state if not already present
+        # Initialize messages and context tracking in session state
         if 'messages' not in st.session_state:
             st.session_state.messages = [
                 Message(
@@ -53,9 +55,29 @@ class RAGPipeline:
                     content="""You are an AWS documentation assistant. Your role is to provide accurate, 
                     helpful answers about AWS services and features based on the provided documentation context.
                     Only answer based on the provided context. If the context doesn't contain enough information,
-                    say so. Include code examples when available and cite sources using [Title] notation."""
+                    say so. Include code examples when available and cite sources using [Title] notation.""",
+                    chunk_hashes=set()
                 )
             ]
+        if 'used_chunks' not in st.session_state:
+            st.session_state.used_chunks = set()
+
+    def _hash_chunk(self, chunk: Dict) -> str:
+        """Create a unique hash for a chunk based on its content and metadata"""
+        content = chunk['content']
+        metadata = str(sorted(chunk['metadata'].items()))  # Convert metadata to stable string
+        return hashlib.md5(f"{content}{metadata}".encode()).hexdigest()
+
+    def _filter_new_chunks(self, chunks: List[Dict]) -> List[Dict]:
+        """Filter out chunks that have been used in previous context"""
+        new_chunks = []
+        for chunk in chunks:
+            chunk_hash = self._hash_chunk(chunk)
+            if chunk_hash not in st.session_state.used_chunks:
+                new_chunks.append(chunk)
+                # Add to tracking sets
+                st.session_state.used_chunks.add(chunk_hash)
+        return new_chunks
 
     def _convert_to_langchain_messages(self, messages: List[Message], include_system: bool = True):
         """Convert our Message objects to LangChain message format"""
@@ -69,12 +91,13 @@ class RAGPipeline:
                 langchain_messages.append(AIMessage(content=msg.content))
         return langchain_messages
 
-    def format_context(self, chunks: List[Dict]) -> str:
-        """Format context chunks into a string"""
+    def format_context(self, chunks: List[Dict], new_chunks_only: bool = True) -> str:
+        """Format context chunks into a string, optionally marking new chunks"""
         context_parts = []
         for chunk in chunks:
             title = chunk['metadata'].get('title', 'Unknown Section')
-            context_parts.append(f"[{title}]\n{chunk['content']}")
+            prefix = "[NEW] " if new_chunks_only and chunk in self._filter_new_chunks(chunks) else ""
+            context_parts.append(f"{prefix}[{title}]\n{chunk['content']}")
         return "\n\n".join(context_parts)
     
     async def get_answer(
@@ -89,40 +112,47 @@ class RAGPipeline:
         
         try:
             # Retrieve relevant chunks
-            chunks = self.vector_store.search_similar(
+            all_chunks = self.vector_store.search_similar(
                 query=question,
                 url_id=url_id,
                 n_results=max_chunks,
                 min_relevance=min_relevance
             )
             
-            if not chunks:
+            # Filter for new chunks
+            new_chunks = self._filter_new_chunks(all_chunks)
+            
+            if not new_chunks and not all_chunks:
                 no_context_response = RAGResponse(
                     answer="I don't have enough context in my knowledge base to answer this question.",
                     sources=[],
                     confidence=0.0
                 )
                 
-                # Add messages to history
                 st.session_state.messages.extend([
                     Message(role="user", content=question),
                     Message(
                         role="assistant",
                         content=no_context_response.answer,
-                        confidence=0.0
+                        confidence=0.0,
+                        chunk_hashes=set()
                     )
                 ])
                 return no_context_response
             
-            # Format context
-            context = self.format_context(chunks)
+            # Format context, including only new chunks
+            context = self.format_context(new_chunks) if new_chunks else ""
             
-            # Create the contextual question but don't add to visible history
+            if not context:
+                context = "Using previously provided context."
+            
+            # Create the contextual question
             contextual_question = f"""Context information is below:
             ---------------
             {context}
             ---------------
-            Question: {question}"""
+            Question: {question}
+            Note: Context shown is additional to previously provided information."""
             
             # Convert history to LangChain format
             history_messages = self._convert_to_langchain_messages(st.session_state.messages)
@@ -130,36 +160,41 @@ class RAGPipeline:
             # Add the contextual question
             llm_messages = history_messages + [HumanMessage(content=contextual_question)]
             
+            self.logger.info(f"LLM messages: {llm_messages}")
             # Get response from LLM
             response = await self._llm.ainvoke(llm_messages)
             
-            # Calculate confidence
-            avg_relevance = sum(chunk.get('relevance', 0) for chunk in chunks) / len(chunks)
+            # Calculate confidence based on all relevant chunks
+            avg_relevance = sum(chunk.get('relevance', 0) for chunk in all_chunks) / len(all_chunks)
             
-            # Format sources
-            sources_text = self.format_sources(chunks)
+            # Format sources (show all relevant sources, both new and previously used)
+            sources_text = self.format_sources(all_chunks)
+            
+            # Create chunk hashes set for this message
+            current_chunk_hashes = {self._hash_chunk(chunk) for chunk in all_chunks}
             
             # Create RAG response
             rag_response = RAGResponse(
                 answer=response.content,
-                sources=chunks,
+                sources=all_chunks,
                 confidence=avg_relevance
             )
             
-            # Add visible messages to history (original question, not contextual)
+            # Add visible messages to history
             st.session_state.messages.extend([
                 Message(role="user", content=question),
                 Message(
                     role="assistant",
                     content=response.content,
                     sources=sources_text,
-                    confidence=avg_relevance
+                    confidence=avg_relevance,
+                    chunk_hashes=current_chunk_hashes
                 )
             ])
             
             # Keep only last N turns plus system message
             max_turns = 10  # 5 turns (question/answer pairs)
-            if len(st.session_state.messages) > (max_turns + 1):  # +1 for system message
+            if len(st.session_state.messages) > (max_turns + 1):
                 st.session_state.messages = [st.session_state.messages[0]] + st.session_state.messages[-(max_turns):]
             
             return rag_response
@@ -168,13 +203,13 @@ class RAGPipeline:
             error_msg = f"Error in RAG pipeline: {str(e)}"
             self.logger.error(error_msg)
             
-            # Add error message to history
             st.session_state.messages.extend([
                 Message(role="user", content=question),
                 Message(
                     role="assistant",
                     content=error_msg,
-                    confidence=0.0
+                    confidence=0.0,
+                    chunk_hashes=set()
                 )
             ])
             
@@ -194,12 +229,15 @@ class RAGPipeline:
             self.logger.info(f"Metadata: {metadata}")
             relevance = round(source.get('relevance', 0), 2)
             path = metadata.get('path', '')
+            is_new = self._hash_chunk(source) in self._filter_new_chunks([source])
+            prefix = "[NEW] " if is_new else ""
             if url:
-                formatted_sources.append(f"- [{title}]({url}) *{path}* ({relevance})")
+                formatted_sources.append(f"- {prefix}[{title}]({url}) *{path}* ({relevance})")
             else:
-                formatted_sources.append(f"- {title} *{path}* ({relevance})")
+                formatted_sources.append(f"- {prefix}{title} *{path}* ({relevance})")
         return "\n".join(formatted_sources)
     
     def clear_history(self):
-        """Clear conversation history but keep system prompt"""
+        """Clear conversation history and context tracking"""
         st.session_state.messages = [st.session_state.messages[0]]  # Keep only system message
+        st.session_state.used_chunks = set()  # Reset chunk tracking
