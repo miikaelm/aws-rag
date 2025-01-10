@@ -1,18 +1,19 @@
 import streamlit as st
 from typing import Dict, List, Optional
-from dataclasses import dataclass
 import asyncio
-from contextlib import asynccontextmanager
-from utils.vector_store import VectorStore
-from utils.rag import RAGPipeline, UIMessage
-from utils.logger import Logger
-from utils.database import get_database
 from datetime import datetime
+from utils.vector_store import VectorStore
+from utils.rag import RAGPipeline
+from utils.logger import Logger
+from db.models.conversation import Conversation
+from db.models.message import Message
+from db.models.message_source import MessageSource
+from db.connection import get_db
 
 def initialize_components():
     """Initialize all necessary components"""
-    # Get database instance
-    get_database()
+    # Initialize database instance
+    get_db()
     
     # Initialize other components
     if 'vector_store' not in st.session_state:
@@ -35,27 +36,22 @@ def get_or_create_eventloop():
 class ChatInterface:
     def __init__(self):
         self.logger = Logger()
-        self.db = get_database()
+        
+        # Load available conversations
+        self.conversations = Conversation.get_all()
         
         # Initialize conversation state
         if 'current_conversation_id' not in st.session_state:
             self._initialize_active_conversation()
-            
-        # Load available conversations
-        self.conversations = self.db.get_conversations()
 
     def _initialize_active_conversation(self):
-            """Set the active conversation"""
-            latest_conv_id = self.db.get_latest_conversation()
-            if latest_conv_id:
-                st.session_state.current_conversation_id = latest_conv_id
-            else:
-                # Create new conversation if none exists
-                st.session_state.current_conversation_id = self.db.create_conversation()
-
-    def _create_new_conversation(self) -> str:
-        """Create a new conversation and return its ID"""
-        return f"conv_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        """Set the active conversation"""
+        if self.conversations:
+            st.session_state.current_conversation_id = self.conversations[0].id
+        else:
+            # Create new conversation if none exists
+            new_conv = Conversation.create()
+            st.session_state.current_conversation_id = new_conv.id
 
     def conversation_selector(self):
         """Display conversation selector in the sidebar"""
@@ -63,8 +59,9 @@ class ChatInterface:
             st.subheader("Conversations")
             
             # New conversation button
-            if st.button("New Conversation", type="primary"):
-                st.session_state.current_conversation_id = self.db.create_conversation()
+            if st.button("New Conversation", type="secondary"):
+                new_conv = Conversation.create()
+                st.session_state.current_conversation_id = new_conv.id
                 st.rerun()
             
             st.divider()
@@ -73,96 +70,98 @@ class ChatInterface:
             for conv in self.conversations:
                 col1, col2 = st.columns([4, 1])
                 with col1:
+                    preview = getattr(conv, 'preview', '') or 'New Conversation'
                     button_text = (
-                        f"{conv['title']}\n"
-                        f"{datetime.fromisoformat(conv['updated_at']).strftime('%Y-%m-%d %H:%M')}"
+                        f"{conv.title or 'New Conversation'}\n"
+                        f"{datetime.fromisoformat(str(conv.updated_at)).strftime('%Y-%m-%d %H:%M')}\n"
+                        f"{preview}"
                     )
                     
                     if st.button(
                         button_text,
-                        key=f"conv_{conv['id']}",
-                        type="primary" if conv['id'] == st.session_state.current_conversation_id else "secondary",
+                        key=f"conv_{conv.id}",
+                        type="secondary" if conv.id == st.session_state.current_conversation_id else "tertiary",
                         use_container_width=True
                     ):
-                        st.session_state.current_conversation_id = conv['id']
+                        st.session_state.current_conversation_id = conv.id
                         st.rerun()
                 
                 # Delete conversation button
                 with col2:
-                    if st.button("🗑️", key=f"del_{conv['id']}", type="secondary"):
-                        self.db.delete_conversation(conv['id'])
-                        if conv['id'] == st.session_state.current_conversation_id:
+                    if st.button("🗑️", key=f"del_{conv.id}", type="secondary"):
+                        conv_obj = Conversation(id=conv.id)
+                        conv_obj.delete()
+                        if conv.id == st.session_state.current_conversation_id:
                             self._initialize_active_conversation()
                         st.rerun()
 
     def display_chat_history(self):
-        """Display current conversation from DB"""
-        messages = self.db.get_conversation_messages(st.session_state.current_conversation_id)
+        """Display current conversation messages"""
+        messages = Message.get_conversation_messages(st.session_state.current_conversation_id)
         
         # Display conversation title if it exists
         current_conv = next(
-            (c for c in self.conversations if c['id'] == st.session_state.current_conversation_id), 
+            (c for c in self.conversations if c.id == st.session_state.current_conversation_id), 
             None
         )
-        if current_conv and current_conv.get('title'):
-            st.caption(f"Current conversation: {current_conv['title']}")
+        if current_conv and current_conv.title:
+            st.caption(f"Current conversation: {current_conv.title}")
         
         for msg in messages:
-            if msg['message']['role'] == "user":
+            if msg.role == "user":
                 with st.chat_message("user"):
-                    st.write(msg['message']['content'])
+                    st.write(msg.content)
             
-            elif msg['message']['role'] == "assistant":
+            elif msg.role == "assistant":
                 with st.chat_message("assistant"):
-                    st.write(msg['message']['content'])
-                    if msg['sources']:
+                    st.write(msg.content)
+                    if msg.sources:
                         with st.expander("View Sources"):
-                            st.markdown(self._format_sources(msg['sources']))
-                            confidence = msg['message']['confidence']
-                            if confidence is not None:
-                                st.progress(confidence)
-                                st.caption(f"Confidence Score: {confidence}")
-
+                            st.markdown(self._format_sources(msg.sources))
+                            if msg.confidence is not None:
+                                st.progress(msg.confidence)
+                                st.caption(f"Confidence Score: {msg.confidence}")
 
     async def process_question(self, question: str):
-        """Process user question and save directly to DB"""
+        """Process user question and save using Message model"""
         try:
-            # Save user question to DB
-            msg_order = self.db.get_next_message_order(st.session_state.current_conversation_id)
-            user_msg_id = self.db.save_message(
+            # Create and save user message
+            user_msg = Message(
                 conversation_id=st.session_state.current_conversation_id,
                 role="user",
-                content=question,
-                message_order=msg_order
+                content=question
             )
+            user_msg.save()
 
             # Get response from RAG pipeline
             response = await st.session_state.rag_pipeline.get_answer(question)
             
-            # Save assistant response to DB
-            assistant_msg_id = self.db.save_message(
+            # Create and save assistant message
+            assistant_msg = Message(
                 conversation_id=st.session_state.current_conversation_id,
                 role="assistant",
                 content=response.answer,
-                confidence=response.confidence,
-                message_order=msg_order + 1
+                confidence=response.confidence
             )
+            assistant_msg.save()
             
-            # Save sources
-            if hasattr(response, 'sources'):
-                self.db.save_message_sources(assistant_msg_id, response.sources)
+            # Save sources if available
+            if hasattr(response, 'sources') and assistant_msg.id:
+                for source in response.sources:
+                    source['message_id'] = assistant_msg.id
+                    MessageSource(**source).save()
 
         except Exception as e:
             self.logger.error(f"Error processing question: {str(e)}")
             st.error("I encountered an error while processing your question. Please try again.")
 
-    def _format_sources(self, sources: List[Dict]) -> str:
+    def _format_sources(self, sources: List['MessageSource']) -> str:
         """Format source references for display in markdown"""
         formatted_sources = []
         for source in sources:
-            title = source.get('title', 'Unknown Section')
-            url = source.get('url', '')
-            relevance = round(source.get('relevance_score', 0), 2)
+            title = getattr(source, 'title', 'Unknown Section')
+            url = getattr(source, 'url', '')
+            relevance = round(getattr(source, 'relevance_score', 0), 2)
             
             if url:
                 formatted_sources.append(f"- [{title}]({url}) (Relevance: {relevance})")
@@ -193,7 +192,7 @@ def main():
         chat.display_chat_history()
         st.divider()
         
-                # Callback to handle input submission
+        # Callback to handle input submission
         def handle_input():
             if st.session_state.user_input:
                 if st.session_state.vector_store.get_stats()["total_chunks"] == 0:
@@ -218,7 +217,8 @@ def main():
         
         # Add clear chat button
         if st.button("Clear Chat", type="secondary"):
-            st.session_state.current_conversation_id = chat.db.create_conversation()
+            new_conv = Conversation.create()
+            st.session_state.current_conversation_id = new_conv.id
             st.rerun()
 
 if __name__ == "__main__":
