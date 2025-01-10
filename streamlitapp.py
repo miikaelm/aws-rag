@@ -9,6 +9,7 @@ from db.models.conversation import Conversation
 from db.models.message import Message
 from db.models.message_source import MessageSource
 from db.connection import get_db
+from utils.scraper import DocumentScraper
 
 def initialize_components():
     """Initialize all necessary components"""
@@ -24,6 +25,9 @@ def initialize_components():
         
     if 'processing' not in st.session_state:
         st.session_state.processing = False
+        
+    if 'scraper' not in st.session_state:
+        st.session_state.scraper = DocumentScraper()
 
 def get_or_create_eventloop():
     """Get the current event loop or create a new one"""
