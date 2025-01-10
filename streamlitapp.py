@@ -7,6 +7,7 @@ from utils.vector_store import VectorStore
 from utils.rag import RAGPipeline, UIMessage
 from utils.logger import Logger
 from utils.database import get_database
+from datetime import datetime
 
 def initialize_components():
     """Initialize all necessary components"""
@@ -34,54 +35,104 @@ def get_or_create_eventloop():
 class ChatInterface:
     def __init__(self):
         self.logger = Logger()
+        self.db = get_database()
+        
+        # Only store active conversation ID in session state
+        if 'current_conversation_id' not in st.session_state:
+            self._initialize_active_conversation()
 
-    @asynccontextmanager
-    async def _processing_state(self):
-        """Context manager to handle processing state"""
-        st.session_state.processing = True
-        try:
-            yield
-        finally:
-            st.session_state.processing = False
-
-    def _display_message(self, message: UIMessage):
-        """Display a single chat message with proper formatting"""
-        # Display user messages
-        if message.role == "user":
-            with st.chat_message("user"):
-                st.write(message.content)
-                
-        # Display assistant messages with sources and confidence
-        elif message.role == "assistant":
-            with st.chat_message("assistant"):
-                st.write(message.content)
-                if message.sources:
-                    with st.expander("View Sources"):
-                        st.markdown(message.sources)
-                        if message.confidence is not None:
-                            confidence = round(message.confidence, 2)
-                            st.progress(confidence)
-                            st.caption(f"Confidence Score: {confidence}")
+    def _initialize_active_conversation(self):
+        """Set the active conversation"""
+        with self.db.get_cursor() as cursor:
+            # Get most recent conversation or create new
+            cursor.execute('''
+                SELECT conversation_id FROM messages 
+                GROUP BY conversation_id 
+                ORDER BY MAX(created_at) DESC 
+                LIMIT 1
+            ''')
+            result = cursor.fetchone()
+            
+            st.session_state.current_conversation_id = (
+                result[0] if result 
+                else f"conv_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            )
 
     def display_chat_history(self):
-        """Display the entire chat history"""
-        self.logger.info(f"Displaying chat history with {len(st.session_state.ui_messages)} messages")
-        # Display all UI messages
-        for message in st.session_state.ui_messages:
-            self._display_message(message)
+        """Display current conversation from DB"""
+        messages = self.db.get_conversation_messages(st.session_state.current_conversation_id)
+        
+        for msg in messages:
+            if msg['message']['role'] == "user":
+                with st.chat_message("user"):
+                    st.write(msg['message']['content'])
+                    
+            elif msg['message']['role'] == "assistant":
+                with st.chat_message("assistant"):
+                    st.write(msg['message']['content'])
+                    if msg['sources']:
+                        with st.expander("View Sources"):
+                            st.markdown(self._format_sources(msg['sources']))
+                            confidence = msg['message']['confidence']
+                            if confidence is not None:
+                                st.progress(confidence)
+                                st.caption(f"Confidence Score: {confidence}")
 
     async def process_question(self, question: str):
-        """Process user question through RAG pipeline"""
-        async with self._processing_state():
-            try:
-                # Get response from RAG pipeline
-                # Note: RAG pipeline now handles adding messages to both histories
-                response = await st.session_state.rag_pipeline.get_answer(question)
-                
-            except Exception as e:
-                self.logger.error(f"Error processing question: {str(e)}")
-                st.error("I encountered an error while processing your question. Please try again.")
+        """Process user question and save directly to DB"""
+        try:
+            # Save user question to DB
+            msg_order = self._get_next_message_order()
+            user_msg_id = self.db.save_message(
+                conversation_id=st.session_state.current_conversation_id,
+                role="user",
+                content=question,
+                message_order=msg_order
+            )
 
+            # Get response from RAG pipeline
+            response = await st.session_state.rag_pipeline.get_answer(question)
+            
+            # Save assistant response to DB
+            assistant_msg_id = self.db.save_message(
+                conversation_id=st.session_state.current_conversation_id,
+                role="assistant",
+                content=response.answer,
+                confidence=response.confidence,
+                message_order=msg_order + 1
+            )
+            
+            # Save sources
+            self.db.save_message_sources(assistant_msg_id, response.sources)
+
+        except Exception as e:
+            self.logger.error(f"Error processing question: {str(e)}")
+            st.error("I encountered an error while processing your question. Please try again.")
+
+    def _format_sources(self, sources: List[Dict]) -> str:
+        """Format source references for display in markdown"""
+        formatted_sources = []
+        for source in sources:
+            title = source.get('title', 'Unknown Section')
+            url = source.get('url', '')
+            relevance = round(source.get('relevance_score', 0), 2)
+            
+            if url:
+                formatted_sources.append(f"- [{title}]({url}) (Relevance: {relevance})")
+            else:
+                formatted_sources.append(f"- {title} (Relevance: {relevance})")
+                
+        return "\n".join(formatted_sources) if formatted_sources else "No sources available"
+
+    def _get_next_message_order(self) -> int:
+        """Get next message order for current conversation"""
+        with self.db.get_cursor() as cursor:
+            cursor.execute('''
+                SELECT COALESCE(MAX(message_order), -1) + 1
+                FROM messages 
+                WHERE conversation_id = ?
+            ''', (st.session_state.current_conversation_id,))
+            return cursor.fetchone()[0]
 def main():
     st.set_page_config(
         page_title="AWS Documentation RAG",

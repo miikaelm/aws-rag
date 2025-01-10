@@ -102,6 +102,49 @@ class Schema:
                 FOREIGN KEY (url_id) REFERENCES urls (id) ON DELETE CASCADE,
                 FOREIGN KEY (parent_id) REFERENCES sections (id) ON DELETE CASCADE
             )
+        ''',
+        'messages': '''
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id TEXT NOT NULL,  -- Group messages in conversations
+                role TEXT NOT NULL,            -- 'user' or 'assistant'
+                content TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                model_version TEXT,            -- Track which model generated the response
+                confidence FLOAT,               -- The original confidence score
+                message_order INTEGER NOT NULL
+            )
+        ''',
+        'message_sources': '''
+            CREATE TABLE IF NOT EXISTS message_sources (
+                id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                url TEXT,
+                content TEXT NOT NULL,
+                relevance_score FLOAT,
+                FOREIGN KEY (message_id) REFERENCES messages(id)
+            )
+        ''',
+        'message_feedback': '''
+            CREATE TABLE IF NOT EXISTS message_feedback (
+                id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                answer_relevance INTEGER CHECK (answer_relevance BETWEEN 1 AND 5),
+                answer_accuracy INTEGER CHECK (answer_accuracy BETWEEN 1 AND 5),
+                feedback_text TEXT,            -- Optional user comments
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (message_id) REFERENCES messages(id)
+            )
+        ''',
+        'source_feedback': '''
+            CREATE TABLE IF NOT EXISTS source_feedback (
+                id INTEGER PRIMARY KEY,
+                message_source_id INTEGER NOT NULL,
+                rating INTEGER CHECK (rating BETWEEN 1 AND 5),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (message_source_id) REFERENCES message_sources(id)
+            )
         '''
     }
     
@@ -283,6 +326,12 @@ class Database:
         """Initialize database"""
         self.schema.init_db()
     
+    @contextmanager
+    def get_cursor(self) -> Generator[sqlite3.Cursor, None, None]:
+        """Direct cursor access"""
+        with self.db.get_cursor() as cursor:
+            yield cursor
+            
     def add_url(self, url: str, description: str) -> bool:
         """Add a new URL to the database"""
         try:
@@ -410,6 +459,153 @@ class Database:
                     subsections=[]
                 )
                 for row in cursor.fetchall()
+            ]
+    
+    def save_message(
+        self,
+        conversation_id: str,
+        role: str,
+        content: str,
+        model_version: Optional[str] = None,
+        confidence: Optional[float] = None,
+        message_order: Optional[int] = None
+    ) -> int:
+        """Save a message and return its ID"""
+        with self.db.get_cursor() as cursor:
+            cursor.execute('''
+                INSERT INTO messages (
+                    conversation_id, role, content, 
+                    model_version, confidence, message_order, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                conversation_id,
+                role,
+                content,
+                model_version,
+                confidence,
+                message_order,
+                datetime.now()
+            ))
+            return cursor.lastrowid
+
+    def save_message_sources(
+        self,
+        message_id: int,
+        sources: List[Dict]
+    ) -> None:
+        """Save sources for a message"""
+        with self.db.get_cursor() as cursor:
+            for source in sources:
+                cursor.execute('''
+                    INSERT INTO message_sources (
+                        message_id, title, url,
+                        content, relevance_score
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (
+                    message_id,
+                    source['metadata'].get('title'),
+                    source['metadata'].get('url'),
+                    source['content'],
+                    source.get('relevance', 0.0)
+                ))
+
+    def save_message_feedback(
+        self,
+        message_id: int,
+        answer_relevance: int,
+        answer_accuracy: int,
+        feedback_text: Optional[str] = None
+    ) -> int:
+        """Save feedback for a message"""
+        with self.db.get_cursor() as cursor:
+            cursor.execute('''
+                INSERT INTO message_feedback (
+                    message_id, answer_relevance,
+                    answer_accuracy, feedback_text,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+            ''', (
+                message_id,
+                answer_relevance,
+                answer_accuracy,
+                feedback_text,
+                datetime.now()
+            ))
+            return cursor.lastrowid
+
+    def save_source_feedback(
+        self,
+        message_source_id: int,
+        rating: int
+    ) -> int:
+        """Save feedback for a source"""
+        with self.db.get_cursor() as cursor:
+            cursor.execute('''
+                INSERT INTO source_feedback (
+                    message_source_id, rating,
+                    created_at
+                )
+                VALUES (?, ?, ?)
+            ''', (
+                message_source_id,
+                rating,
+                datetime.now()
+            ))
+            return cursor.lastrowid
+
+    def get_message_with_sources(self, message_id: int) -> Dict:
+        """Get a message and its sources"""
+        with self.db.get_cursor() as cursor:
+            cursor.execute('''
+                SELECT id, conversation_id, role, content, 
+                    model_version, confidence, created_at
+                FROM messages
+                WHERE id = ?
+            ''', (message_id,))
+            message = cursor.fetchone()
+            
+            cursor.execute('''
+                SELECT id, title, url, content, relevance_score
+                FROM message_sources
+                WHERE message_id = ?
+            ''', (message_id,))
+            sources = cursor.fetchall()
+            
+            return {
+                'message': {
+                    'id': message[0],
+                    'conversation_id': message[1],
+                    'role': message[2],
+                    'content': message[3],
+                    'model_version': message[4],
+                    'confidence': message[5],
+                    'created_at': message[6]
+                },
+                'sources': [{
+                    'id': s[0],
+                    'title': s[1],
+                    'url': s[2],
+                    'content': s[3],
+                    'relevance_score': s[4]
+                } for s in sources]
+            }
+
+    def get_conversation_messages(self, conversation_id: str) -> List[Dict]:
+        """Get all messages in a conversation with their sources"""
+        with self.db.get_cursor() as cursor:
+            cursor.execute('''
+                SELECT id FROM messages
+                WHERE conversation_id = ?
+                ORDER BY created_at
+            ''', (conversation_id,))
+            message_ids = cursor.fetchall()
+            
+            return [
+                self.get_message_with_sources(mid[0])
+                for mid in message_ids
             ]
 
 # Initialize database helper
