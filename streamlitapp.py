@@ -37,9 +37,42 @@ class ChatInterface:
         self.logger = Logger()
         self.db = get_database()
         
-        # Only store active conversation ID in session state
+        # Initialize conversation state
         if 'current_conversation_id' not in st.session_state:
             self._initialize_active_conversation()
+            
+        # Load available conversations
+        self.conversations = self._load_conversations()
+
+    def _load_conversations(self) -> List[Dict]:
+        """Load all conversations with their latest message"""
+        with self.db.get_cursor() as cursor:
+            cursor.execute('''
+                SELECT 
+                    m1.conversation_id,
+                    m1.content as latest_message,
+                    m1.created_at,
+                    COUNT(m2.id) as message_count
+                FROM messages m1
+                INNER JOIN (
+                    SELECT conversation_id, MAX(created_at) as max_created_at
+                    FROM messages
+                    GROUP BY conversation_id
+                ) latest ON m1.conversation_id = latest.conversation_id 
+                AND m1.created_at = latest.max_created_at
+                LEFT JOIN messages m2 ON m1.conversation_id = m2.conversation_id
+                GROUP BY m1.conversation_id
+                ORDER BY m1.created_at DESC
+            ''')
+            return [
+                {
+                    'id': row[0],
+                    'preview': row[1][:50] + "..." if len(row[1]) > 50 else row[1],
+                    'created_at': row[2],
+                    'message_count': row[3]
+                }
+                for row in cursor.fetchall()
+            ]
 
     def _initialize_active_conversation(self):
         """Set the active conversation"""
@@ -55,8 +88,45 @@ class ChatInterface:
             
             st.session_state.current_conversation_id = (
                 result[0] if result 
-                else f"conv_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                else self._create_new_conversation()
             )
+
+    def _create_new_conversation(self) -> str:
+        """Create a new conversation and return its ID"""
+        return f"conv_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    def conversation_selector(self):
+        """Display conversation selector in the sidebar"""
+        with st.sidebar:
+            st.subheader("Conversations")
+            
+            # New conversation button
+            if st.button("New Conversation"):
+                st.session_state.current_conversation_id = self._create_new_conversation()
+                st.rerun()
+            
+            st.divider()
+            
+            # List existing conversations
+            for conv in self.conversations:
+                col1, col2 = st.columns([4, 1])
+                with col1:
+                    if st.button(
+                        f"{conv['preview']}\n{datetime.fromisoformat(conv['created_at']).strftime('%Y-%m-%d %H:%M')}",
+                        key=f"conv_{conv['id']}",
+                        type="secondary" if conv['id'] != st.session_state.current_conversation_id else "tertiary",
+                        use_container_width=True
+                    ):
+                        st.session_state.current_conversation_id = conv['id']
+                        st.rerun()
+                
+                # Delete conversation button
+                with col2:
+                    if st.button("🗑️", key=f"del_{conv['id']}", type="secondary"):
+                        self.db.delete_conversation(conv['id'])
+                        if conv['id'] == st.session_state.current_conversation_id:
+                            self._initialize_active_conversation()
+                        st.rerun()
 
     def display_chat_history(self):
         """Display current conversation from DB"""
@@ -66,7 +136,7 @@ class ChatInterface:
             if msg['message']['role'] == "user":
                 with st.chat_message("user"):
                     st.write(msg['message']['content'])
-                    
+            
             elif msg['message']['role'] == "assistant":
                 with st.chat_message("assistant"):
                     st.write(msg['message']['content'])
@@ -82,7 +152,7 @@ class ChatInterface:
         """Process user question and save directly to DB"""
         try:
             # Save user question to DB
-            msg_order = self._get_next_message_order()
+            msg_order = self.db.get_next_message_order(st.session_state.current_conversation_id)
             user_msg_id = self.db.save_message(
                 conversation_id=st.session_state.current_conversation_id,
                 role="user",
@@ -103,7 +173,8 @@ class ChatInterface:
             )
             
             # Save sources
-            self.db.save_message_sources(assistant_msg_id, response.sources)
+            if hasattr(response, 'sources'):
+                self.db.save_message_sources(assistant_msg_id, response.sources)
 
         except Exception as e:
             self.logger.error(f"Error processing question: {str(e)}")
@@ -124,15 +195,6 @@ class ChatInterface:
                 
         return "\n".join(formatted_sources) if formatted_sources else "No sources available"
 
-    def _get_next_message_order(self) -> int:
-        """Get next message order for current conversation"""
-        with self.db.get_cursor() as cursor:
-            cursor.execute('''
-                SELECT COALESCE(MAX(message_order), -1) + 1
-                FROM messages 
-                WHERE conversation_id = ?
-            ''', (st.session_state.current_conversation_id,))
-            return cursor.fetchone()[0]
 def main():
     st.set_page_config(
         page_title="AWS Documentation RAG",
@@ -144,13 +206,8 @@ def main():
     
     st.title("AWS Documentation Assistant")
     
-    st.write("""
-    Welcome to the AWS Documentation Assistant! This tool helps you search and understand AWS documentation.
-    
-    Use the sidebar to:
-    - Chat with the documentation
-    - Manage documentation sources in Settings
-    """)
+    # Add conversation selector to sidebar
+    chat.conversation_selector()
     
     # Main chat interface
     with st.container():
@@ -160,7 +217,7 @@ def main():
         chat.display_chat_history()
         st.divider()
         
-        # Callback to handle input submission
+                # Callback to handle input submission
         def handle_input():
             if st.session_state.user_input:
                 if st.session_state.vector_store.get_stats()["total_chunks"] == 0:
@@ -174,7 +231,7 @@ def main():
                     with st.spinner("Searching documentation..."):
                         loop = get_or_create_eventloop()
                         loop.run_until_complete(chat.process_question(question))
-        
+                        
         # User input - disabled during processing
         st.text_input(
             "Your question:",
@@ -184,12 +241,9 @@ def main():
         )
         
         # Add clear chat button
-        col1, col2 = st.columns([6, 1])
-        with col2:
-            if len(st.session_state.ui_messages) > 0 and st.button("Clear Chat", type="secondary"):
-                # Clear both histories through RAG pipeline
-                st.session_state.rag_pipeline.clear_history()
-                st.rerun()
+        if st.button("Clear Chat", type="secondary"):
+            st.session_state.current_conversation_id = chat.db.create_conversation()
+            st.rerun()
 
 if __name__ == "__main__":
     main()

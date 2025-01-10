@@ -460,34 +460,6 @@ class Database:
                 )
                 for row in cursor.fetchall()
             ]
-    
-    def save_message(
-        self,
-        conversation_id: str,
-        role: str,
-        content: str,
-        model_version: Optional[str] = None,
-        confidence: Optional[float] = None,
-        message_order: Optional[int] = None
-    ) -> int:
-        """Save a message and return its ID"""
-        with self.db.get_cursor() as cursor:
-            cursor.execute('''
-                INSERT INTO messages (
-                    conversation_id, role, content, 
-                    model_version, confidence, message_order, created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                conversation_id,
-                role,
-                content,
-                model_version,
-                confidence,
-                message_order,
-                datetime.now()
-            ))
-            return cursor.lastrowid
 
     def save_message_sources(
         self,
@@ -555,17 +527,130 @@ class Database:
                 datetime.now()
             ))
             return cursor.lastrowid
+            
+    def get_conversations(self) -> List[Dict]:
+        """Get all conversations with their latest message"""
+        with self.db.get_cursor() as cursor:
+            cursor.execute('''
+                WITH RankedMessages AS (
+                    SELECT 
+                        m.*,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY conversation_id 
+                            ORDER BY created_at DESC
+                        ) as rn
+                    FROM messages m
+                )
+                SELECT 
+                    m.conversation_id,
+                    m.content as latest_message,
+                    m.created_at,
+                    COUNT(all_msgs.id) as message_count
+                FROM RankedMessages m
+                JOIN messages all_msgs ON m.conversation_id = all_msgs.conversation_id
+                WHERE m.rn = 1
+                GROUP BY m.conversation_id
+                ORDER BY m.created_at DESC
+            ''')
+            
+            return [{
+                'id': row[0],
+                'preview': row[1][:50] + "..." if len(row[1]) > 50 else row[1],
+                'created_at': row[2],
+                'message_count': row[3]
+            } for row in cursor.fetchall()]
+
+    def delete_conversation(self, conversation_id: str) -> None:
+        """Delete a conversation and all its associated messages and sources"""
+        with self.db.get_cursor() as cursor:
+            # Delete message sources first due to foreign key constraint
+            cursor.execute('''
+                DELETE FROM message_sources 
+                WHERE message_id IN (
+                    SELECT id FROM messages 
+                    WHERE conversation_id = ?
+                )
+            ''', (conversation_id,))
+            
+            # Then delete the messages
+            cursor.execute(
+                'DELETE FROM messages WHERE conversation_id = ?', 
+                (conversation_id,)
+            )
+
+    def create_conversation(self) -> str:
+        """Create a new conversation ID"""
+        return f"conv_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    def get_latest_conversation(self) -> Optional[str]:
+        """Get the most recent conversation ID"""
+        with self.db.get_cursor() as cursor:
+            cursor.execute('''
+                SELECT conversation_id 
+                FROM messages 
+                GROUP BY conversation_id 
+                ORDER BY MAX(created_at) DESC 
+                LIMIT 1
+            ''')
+            result = cursor.fetchone()
+            return result[0] if result else None
+
+    def get_next_message_order(self, conversation_id: str) -> int:
+        """Get the next message order number for a conversation"""
+        with self.db.get_cursor() as cursor:
+            cursor.execute('''
+                SELECT COALESCE(MAX(message_order), -1) + 1
+                FROM messages 
+                WHERE conversation_id = ?
+            ''', (conversation_id,))
+            return cursor.fetchone()[0]
+
+    def save_message(
+        self,
+        conversation_id: str,
+        role: str,
+        content: str,
+        model_version: Optional[str] = None,
+        confidence: Optional[float] = None,
+        message_order: Optional[int] = None
+    ) -> int:
+        """Save a message and return its ID"""
+        if message_order is None:
+            message_order = self.get_next_message_order(conversation_id)
+            
+        with self.db.get_cursor() as cursor:
+            cursor.execute('''
+                INSERT INTO messages (
+                    conversation_id, role, content, 
+                    model_version, confidence, message_order, 
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                conversation_id,
+                role,
+                content,
+                model_version,
+                confidence,
+                message_order,
+                datetime.now()
+            ))
+            return cursor.lastrowid
 
     def get_message_with_sources(self, message_id: int) -> Dict:
         """Get a message and its sources"""
         with self.db.get_cursor() as cursor:
             cursor.execute('''
-                SELECT id, conversation_id, role, content, 
+                SELECT 
+                    id, conversation_id, role, content, 
                     model_version, confidence, created_at
                 FROM messages
                 WHERE id = ?
             ''', (message_id,))
             message = cursor.fetchone()
+            
+            if not message:
+                return None
             
             cursor.execute('''
                 SELECT id, title, url, content, relevance_score
@@ -597,9 +682,10 @@ class Database:
         """Get all messages in a conversation with their sources"""
         with self.db.get_cursor() as cursor:
             cursor.execute('''
-                SELECT id FROM messages
+                SELECT id 
+                FROM messages
                 WHERE conversation_id = ?
-                ORDER BY created_at
+                ORDER BY message_order
             ''', (conversation_id,))
             message_ids = cursor.fetchall()
             
