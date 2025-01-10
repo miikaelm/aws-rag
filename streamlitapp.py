@@ -8,6 +8,8 @@ from utils.logger import Logger
 from db.models.conversation import Conversation
 from db.models.message import Message
 from db.models.message_source import MessageSource
+from db.models.message_feedback import MessageFeedback
+from db.models.source_feedback import SourceFeedback
 from db.connection import get_db
 from utils.scraper import DocumentScraper
 
@@ -47,6 +49,10 @@ class ChatInterface:
         # Initialize conversation state
         if 'current_conversation_id' not in st.session_state:
             self._initialize_active_conversation()
+            
+        # Initialize feedback states
+        if 'feedback_states' not in st.session_state:
+            st.session_state.feedback_states = {}
 
     def _initialize_active_conversation(self):
         """Set the active conversation"""
@@ -119,9 +125,96 @@ class ChatInterface:
             elif msg.role == "assistant":
                 with st.chat_message("assistant"):
                     st.write(msg.content)
+                    
+                    # Initialize feedback state for this message
+                    if msg.id not in st.session_state.feedback_states:
+                        st.session_state.feedback_states[msg.id] = {
+                            'show_feedback': False,
+                            'relevance': 3,
+                            'accuracy': 3,
+                            'feedback_text': '',
+                            'source_ratings': {}
+                        }
+                    
+                    # Feedback button
+                    col1, col2 = st.columns([6, 1])
+                    with col2:
+                        if st.button("Rate Answer", key=f"fb_{msg.id}"):
+                            st.session_state.feedback_states[msg.id]['show_feedback'] = True
+                    
+                    # Show feedback form if button was clicked
+                    if st.session_state.feedback_states[msg.id]['show_feedback']:
+                        with st.expander("Provide Feedback", expanded=True):
+                            # Message feedback
+                            st.write("Rate the answer:")
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                relevance = st.slider(
+                                    "Relevance",
+                                    1, 5, 
+                                    st.session_state.feedback_states[msg.id]['relevance'],
+                                    key=f"rel_{msg.id}"
+                                )
+                            with col2:
+                                accuracy = st.slider(
+                                    "Accuracy",
+                                    1, 5,
+                                    st.session_state.feedback_states[msg.id]['accuracy'],
+                                    key=f"acc_{msg.id}"
+                                )
+                            
+                            feedback_text = st.text_area(
+                                "Additional feedback (optional):",
+                                value=st.session_state.feedback_states[msg.id]['feedback_text'],
+                                key=f"txt_{msg.id}"
+                            )
+                            
+                            if st.button("Submit Feedback", key=f"submit_{msg.id}"):
+                                try:
+                                    # Save message feedback
+                                    message_feedback = MessageFeedback(
+                                        message_id=msg.id,
+                                        answer_relevance=relevance,
+                                        answer_accuracy=accuracy,
+                                        feedback_text=feedback_text
+                                    )
+                                    message_feedback.save()
+                                    
+                                    # Save source feedback
+                                    for source_id, rating in st.session_state.feedback_states[msg.id]['source_ratings'].items():
+                                        source_feedback = SourceFeedback(
+                                            message_source_id=source_id,
+                                            rating=rating
+                                        )
+                                        source_feedback.save()
+                                    
+                                    st.success("Thank you for your feedback!")
+                                    st.session_state.feedback_states[msg.id]['show_feedback'] = False
+                                    
+                                except Exception as e:
+                                    self.logger.error(f"Error saving feedback: {str(e)}")
+                                    st.error("Error saving feedback. Please try again.")
+                    
+                    # Display sources with feedback options
                     if msg.sources:
                         with st.expander("View Sources"):
                             st.markdown(self._format_sources(msg.sources))
+                            
+                            # Source feedback if feedback form is shown
+                            if st.session_state.feedback_states[msg.id]['show_feedback']:
+                                st.write("Rate the relevance of each source:")
+                                for source in msg.sources:
+                                    if source.id not in st.session_state.feedback_states[msg.id]['source_ratings']:
+                                        st.session_state.feedback_states[msg.id]['source_ratings'][source.id] = 3
+                                    
+                                    source_rating = st.slider(
+                                        f"Source: {source.title}",
+                                        1, 5,
+                                        st.session_state.feedback_states[msg.id]['source_ratings'][source.id],
+                                        key=f"src_{msg.id}_{source.id}"
+                                    )
+                                    st.session_state.feedback_states[msg.id]['source_ratings'][source.id] = source_rating
+                            
                             if msg.confidence is not None:
                                 st.progress(msg.confidence)
                                 st.caption(f"Confidence Score: {msg.confidence}")
