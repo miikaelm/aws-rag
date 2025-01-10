@@ -42,54 +42,16 @@ class ChatInterface:
             self._initialize_active_conversation()
             
         # Load available conversations
-        self.conversations = self._load_conversations()
-
-    def _load_conversations(self) -> List[Dict]:
-        """Load all conversations with their latest message"""
-        with self.db.get_cursor() as cursor:
-            cursor.execute('''
-                SELECT 
-                    m1.conversation_id,
-                    m1.content as latest_message,
-                    m1.created_at,
-                    COUNT(m2.id) as message_count
-                FROM messages m1
-                INNER JOIN (
-                    SELECT conversation_id, MAX(created_at) as max_created_at
-                    FROM messages
-                    GROUP BY conversation_id
-                ) latest ON m1.conversation_id = latest.conversation_id 
-                AND m1.created_at = latest.max_created_at
-                LEFT JOIN messages m2 ON m1.conversation_id = m2.conversation_id
-                GROUP BY m1.conversation_id
-                ORDER BY m1.created_at DESC
-            ''')
-            return [
-                {
-                    'id': row[0],
-                    'preview': row[1][:50] + "..." if len(row[1]) > 50 else row[1],
-                    'created_at': row[2],
-                    'message_count': row[3]
-                }
-                for row in cursor.fetchall()
-            ]
+        self.conversations = self.db.get_conversations()
 
     def _initialize_active_conversation(self):
-        """Set the active conversation"""
-        with self.db.get_cursor() as cursor:
-            # Get most recent conversation or create new
-            cursor.execute('''
-                SELECT conversation_id FROM messages 
-                GROUP BY conversation_id 
-                ORDER BY MAX(created_at) DESC 
-                LIMIT 1
-            ''')
-            result = cursor.fetchone()
-            
-            st.session_state.current_conversation_id = (
-                result[0] if result 
-                else self._create_new_conversation()
-            )
+            """Set the active conversation"""
+            latest_conv_id = self.db.get_latest_conversation()
+            if latest_conv_id:
+                st.session_state.current_conversation_id = latest_conv_id
+            else:
+                # Create new conversation if none exists
+                st.session_state.current_conversation_id = self.db.create_conversation()
 
     def _create_new_conversation(self) -> str:
         """Create a new conversation and return its ID"""
@@ -101,8 +63,8 @@ class ChatInterface:
             st.subheader("Conversations")
             
             # New conversation button
-            if st.button("New Conversation"):
-                st.session_state.current_conversation_id = self._create_new_conversation()
+            if st.button("New Conversation", type="primary"):
+                st.session_state.current_conversation_id = self.db.create_conversation()
                 st.rerun()
             
             st.divider()
@@ -111,10 +73,15 @@ class ChatInterface:
             for conv in self.conversations:
                 col1, col2 = st.columns([4, 1])
                 with col1:
+                    button_text = (
+                        f"{conv['title']}\n"
+                        f"{datetime.fromisoformat(conv['updated_at']).strftime('%Y-%m-%d %H:%M')}"
+                    )
+                    
                     if st.button(
-                        f"{conv['preview']}\n{datetime.fromisoformat(conv['created_at']).strftime('%Y-%m-%d %H:%M')}",
+                        button_text,
                         key=f"conv_{conv['id']}",
-                        type="secondary" if conv['id'] != st.session_state.current_conversation_id else "tertiary",
+                        type="primary" if conv['id'] == st.session_state.current_conversation_id else "secondary",
                         use_container_width=True
                     ):
                         st.session_state.current_conversation_id = conv['id']
@@ -132,6 +99,14 @@ class ChatInterface:
         """Display current conversation from DB"""
         messages = self.db.get_conversation_messages(st.session_state.current_conversation_id)
         
+        # Display conversation title if it exists
+        current_conv = next(
+            (c for c in self.conversations if c['id'] == st.session_state.current_conversation_id), 
+            None
+        )
+        if current_conv and current_conv.get('title'):
+            st.caption(f"Current conversation: {current_conv['title']}")
+        
         for msg in messages:
             if msg['message']['role'] == "user":
                 with st.chat_message("user"):
@@ -147,6 +122,7 @@ class ChatInterface:
                             if confidence is not None:
                                 st.progress(confidence)
                                 st.caption(f"Confidence Score: {confidence}")
+
 
     async def process_question(self, question: str):
         """Process user question and save directly to DB"""

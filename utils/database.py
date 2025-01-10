@@ -8,6 +8,8 @@ from bs4 import BeautifulSoup
 from typing import Optional, Dict, List, Generator, Any, TypeVar, Tuple
 from dataclasses import dataclass
 from urllib.parse import urljoin
+import json
+
 
 # Type variables for generic database operations
 T = TypeVar('T')
@@ -103,50 +105,61 @@ class Schema:
                 FOREIGN KEY (parent_id) REFERENCES sections (id) ON DELETE CASCADE
             )
         ''',
+        'conversations': '''
+            CREATE TABLE IF NOT EXISTS conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                metadata TEXT
+            )
+        ''',
         'messages': '''
             CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id TEXT NOT NULL,  -- Group messages in conversations
-                role TEXT NOT NULL,            -- 'user' or 'assistant'
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id INTEGER NOT NULL,
+                role TEXT NOT NULL,
                 content TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                model_version TEXT,            -- Track which model generated the response
-                confidence FLOAT,               -- The original confidence score
-                message_order INTEGER NOT NULL
+                model_version TEXT,
+                confidence FLOAT,
+                message_order INTEGER NOT NULL,
+                FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
             )
         ''',
         'message_sources': '''
             CREATE TABLE IF NOT EXISTS message_sources (
-                id INTEGER PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 message_id INTEGER NOT NULL,
                 title TEXT NOT NULL,
                 url TEXT,
                 content TEXT NOT NULL,
                 relevance_score FLOAT,
-                FOREIGN KEY (message_id) REFERENCES messages(id)
+                FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
             )
         ''',
         'message_feedback': '''
             CREATE TABLE IF NOT EXISTS message_feedback (
-                id INTEGER PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 message_id INTEGER NOT NULL,
                 answer_relevance INTEGER CHECK (answer_relevance BETWEEN 1 AND 5),
                 answer_accuracy INTEGER CHECK (answer_accuracy BETWEEN 1 AND 5),
-                feedback_text TEXT,            -- Optional user comments
+                feedback_text TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (message_id) REFERENCES messages(id)
+                FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
             )
         ''',
         'source_feedback': '''
             CREATE TABLE IF NOT EXISTS source_feedback (
-                id INTEGER PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 message_source_id INTEGER NOT NULL,
                 rating INTEGER CHECK (rating BETWEEN 1 AND 5),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (message_source_id) REFERENCES message_sources(id)
+                FOREIGN KEY (message_source_id) REFERENCES message_sources(id) ON DELETE CASCADE
             )
         '''
     }
+
     
     def __init__(self, db: DatabaseConnection):
         self.db = db
@@ -528,74 +541,87 @@ class Database:
             ))
             return cursor.lastrowid
             
+    def create_conversation(self) -> int:
+        """Create a new conversation and return its ID"""
+        with self.db.get_cursor() as cursor:
+            cursor.execute('''
+                INSERT INTO conversations (created_at, updated_at)
+                VALUES (CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ''')
+            return cursor.lastrowid
+
     def get_conversations(self) -> List[Dict]:
         """Get all conversations with their latest message"""
         with self.db.get_cursor() as cursor:
             cursor.execute('''
-                WITH RankedMessages AS (
-                    SELECT 
-                        m.*,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY conversation_id 
-                            ORDER BY created_at DESC
-                        ) as rn
-                    FROM messages m
-                )
                 SELECT 
-                    m.conversation_id,
+                    c.id,
+                    c.title,
+                    c.created_at,
+                    c.updated_at,
+                    c.metadata,
                     m.content as latest_message,
-                    m.created_at,
-                    COUNT(all_msgs.id) as message_count
-                FROM RankedMessages m
-                JOIN messages all_msgs ON m.conversation_id = all_msgs.conversation_id
-                WHERE m.rn = 1
-                GROUP BY m.conversation_id
-                ORDER BY m.created_at DESC
+                    COUNT(messages.id) as message_count
+                FROM conversations c
+                LEFT JOIN messages ON c.id = messages.conversation_id
+                LEFT JOIN (
+                    SELECT conversation_id, content
+                    FROM messages m2
+                    WHERE (conversation_id, created_at) IN (
+                        SELECT conversation_id, MAX(created_at)
+                        FROM messages
+                        GROUP BY conversation_id
+                    )
+                ) m ON c.id = m.conversation_id
+                GROUP BY c.id
+                ORDER BY c.updated_at DESC
             ''')
-            
             return [{
                 'id': row[0],
-                'preview': row[1][:50] + "..." if len(row[1]) > 50 else row[1],
+                'title': row[1] or 'New Conversation',
                 'created_at': row[2],
-                'message_count': row[3]
+                'updated_at': row[3],
+                'metadata': json.loads(row[4]) if row[4] else {},
+                'preview': row[5][:50] + "..." if row[5] and len(row[5]) > 50 else (row[5] or ''),
+                'message_count': row[6]
             } for row in cursor.fetchall()]
 
-    def delete_conversation(self, conversation_id: str) -> None:
-        """Delete a conversation and all its associated messages and sources"""
+    def delete_conversation(self, conversation_id: int) -> None:
+        """Delete a conversation and all its associated data"""
         with self.db.get_cursor() as cursor:
-            # Delete message sources first due to foreign key constraint
+            cursor.execute('DELETE FROM conversations WHERE id = ?', (conversation_id,))
+
+    def update_conversation_title(self, conversation_id: int, title: str) -> None:
+        """Update the title of a conversation"""
+        with self.db.get_cursor() as cursor:
             cursor.execute('''
-                DELETE FROM message_sources 
-                WHERE message_id IN (
-                    SELECT id FROM messages 
-                    WHERE conversation_id = ?
-                )
-            ''', (conversation_id,))
-            
-            # Then delete the messages
-            cursor.execute(
-                'DELETE FROM messages WHERE conversation_id = ?', 
-                (conversation_id,)
-            )
-
-    def create_conversation(self) -> str:
-        """Create a new conversation ID"""
-        return f"conv_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-
-    def get_latest_conversation(self) -> Optional[str]:
+                UPDATE conversations 
+                SET title = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            ''', (title, conversation_id))
+        
+    def update_conversation_metadata(self, conversation_id: int, metadata: Dict) -> None:
+        """Update conversation metadata"""
+        with self.db.get_cursor() as cursor:
+            cursor.execute('''
+                UPDATE conversations 
+                SET metadata = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            ''', (json.dumps(metadata), conversation_id))
+    
+    def get_latest_conversation(self) -> Optional[int]:
         """Get the most recent conversation ID"""
         with self.db.get_cursor() as cursor:
             cursor.execute('''
-                SELECT conversation_id 
-                FROM messages 
-                GROUP BY conversation_id 
-                ORDER BY MAX(created_at) DESC 
+                SELECT id 
+                FROM conversations 
+                ORDER BY updated_at DESC 
                 LIMIT 1
             ''')
             result = cursor.fetchone()
             return result[0] if result else None
 
-    def get_next_message_order(self, conversation_id: str) -> int:
+    def get_next_message_order(self, conversation_id: int) -> int:
         """Get the next message order number for a conversation"""
         with self.db.get_cursor() as cursor:
             cursor.execute('''
@@ -607,7 +633,7 @@ class Database:
 
     def save_message(
         self,
-        conversation_id: str,
+        conversation_id: int,
         role: str,
         content: str,
         model_version: Optional[str] = None,
@@ -619,23 +645,56 @@ class Database:
             message_order = self.get_next_message_order(conversation_id)
             
         with self.db.get_cursor() as cursor:
+            # Update conversation's updated_at timestamp
+            cursor.execute('''
+                UPDATE conversations 
+                SET updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            ''', (conversation_id,))
+            
+            # Insert the message
             cursor.execute('''
                 INSERT INTO messages (
                     conversation_id, role, content, 
                     model_version, confidence, message_order, 
                     created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ''', (
                 conversation_id,
                 role,
                 content,
                 model_version,
                 confidence,
-                message_order,
-                datetime.now()
+                message_order
             ))
+            
+            # Set initial conversation title from first user message if not set
+            if role == 'user' and message_order == 0:
+                title = content[:50] + "..." if len(content) > 50 else content
+                cursor.execute('''
+                    UPDATE conversations
+                    SET title = COALESCE(title, ?)
+                    WHERE id = ?
+                ''', (title, conversation_id))
+                
             return cursor.lastrowid
+
+    def get_conversation_messages(self, conversation_id: int) -> List[Dict]:
+        """Get all messages in a conversation with their sources"""
+        with self.db.get_cursor() as cursor:
+            cursor.execute('''
+                SELECT id 
+                FROM messages
+                WHERE conversation_id = ?
+                ORDER BY message_order
+            ''', (conversation_id,))
+            message_ids = cursor.fetchall()
+            
+            return [
+                self.get_message_with_sources(mid[0])
+                for mid in message_ids
+            ]
 
     def get_message_with_sources(self, message_id: int) -> Dict:
         """Get a message and its sources"""
