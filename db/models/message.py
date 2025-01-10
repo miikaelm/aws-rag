@@ -46,3 +46,53 @@ class Message:
                 message.sources = MessageSource.get_for_message(message.id)
                 messages.append(message)
             return messages
+
+    def has_feedback(self) -> bool:
+        """Check if feedback exists for this message"""
+        if not self.id:
+            return False
+            
+        with st.session_state.database.get_cursor() as cursor:
+            cursor.execute('''
+                SELECT id FROM message_feedback 
+                WHERE message_id = ?
+            ''', (self.id,))
+            return cursor.fetchone() is not None
+
+    def get_feedback(self) -> Optional[Dict]:
+        """Get existing feedback for this message"""
+        if not self.id:
+            return None
+            
+        with st.session_state.database.get_cursor() as cursor:
+            cursor.execute('''
+                SELECT answer_relevance, answer_accuracy, feedback_text
+                FROM message_feedback 
+                WHERE message_id = ?
+            ''', (self.id,))
+            row = cursor.fetchone()
+            if row:
+                return {
+                    'relevance': row[0],
+                    'accuracy': row[1],
+                    'feedback_text': row[2] or ''
+                }
+            return None
+
+    def get_source_feedback(self) -> Dict[int, int]:
+        """Get existing source feedback for this message's sources"""
+        if not self.id:
+            return {}
+            
+        source_ratings = {}
+        with st.session_state.database.get_cursor() as cursor:
+            cursor.execute('''
+                SELECT ms.id, sf.rating
+                FROM message_sources ms
+                LEFT JOIN source_feedback sf ON ms.id = sf.message_source_id
+                WHERE ms.message_id = ?
+            ''', (self.id,))
+            for row in cursor.fetchall():
+                if row[1] is not None:  # if there's a rating
+                    source_ratings[row[0]] = row[1]
+        return source_ratings

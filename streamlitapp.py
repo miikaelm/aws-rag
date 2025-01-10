@@ -126,21 +126,41 @@ class ChatInterface:
                 with st.chat_message("assistant"):
                     st.write(msg.content)
                     
-                    # Initialize feedback state for this message
-                    if msg.id not in st.session_state.feedback_states:
-                        st.session_state.feedback_states[msg.id] = {
-                            'show_feedback': False,
-                            'relevance': 3,
-                            'accuracy': 3,
-                            'feedback_text': '',
-                            'source_ratings': {}
-                        }
+                    # Check for existing feedback
+                    has_feedback = msg.has_feedback()
                     
-                    # Feedback button
+                    # Initialize or update feedback state for this message
+                    if msg.id not in st.session_state.feedback_states:
+                        if has_feedback:
+                            # Load existing feedback
+                            existing_feedback = msg.get_feedback()
+                            existing_source_feedback = msg.get_source_feedback()
+                            st.session_state.feedback_states[msg.id] = {
+                                'show_feedback': False,
+                                'has_feedback': True,
+                                'relevance': existing_feedback['relevance'],
+                                'accuracy': existing_feedback['accuracy'],
+                                'feedback_text': existing_feedback['feedback_text'],
+                                'source_ratings': existing_source_feedback
+                            }
+                        else:
+                            st.session_state.feedback_states[msg.id] = {
+                                'show_feedback': False,
+                                'has_feedback': False,
+                                'relevance': 3,
+                                'accuracy': 3,
+                                'feedback_text': '',
+                                'source_ratings': {}
+                            }
+                    
+                    # Feedback button or status
                     col1, col2 = st.columns([6, 1])
                     with col2:
-                        if st.button("Rate Answer", key=f"fb_{msg.id}"):
-                            st.session_state.feedback_states[msg.id]['show_feedback'] = True
+                        if not st.session_state.feedback_states[msg.id]['has_feedback']:
+                            if st.button("Rate Answer", key=f"fb_{msg.id}"):
+                                st.session_state.feedback_states[msg.id]['show_feedback'] = True
+                        else:
+                            st.write("✓ Rated")
                     
                     # Show feedback form if button was clicked
                     if st.session_state.feedback_states[msg.id]['show_feedback']:
@@ -190,6 +210,7 @@ class ChatInterface:
                                     
                                     st.success("Thank you for your feedback!")
                                     st.session_state.feedback_states[msg.id]['show_feedback'] = False
+                                    st.session_state.feedback_states[msg.id]['has_feedback'] = True
                                     
                                 except Exception as e:
                                     self.logger.error(f"Error saving feedback: {str(e)}")
