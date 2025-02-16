@@ -2,7 +2,7 @@
 
 A Streamlit application that implements RAG (Retrieval-Augmented Generation) for AWS documentation. The application scrapes AWS documentation, processes it into searchable sections, and enables natural language querying with accurate source citations.
 
-A proof-of-concept/prototype. Something I hacked together in two days so definitely not the cleanest implementation
+A proof-of-concept/prototype. Something I hacked together in two days so definitely not the cleanest implementation. Implementation of a basic RAG is simple, but the idea was to create a "framework" around a production-level RAG, where the users can give feedback to output of the system. This feedback can then be used to first of all track the performance AND the improvement of the RAG system over time, but also to act as a test data to measure the expected performance change after system changes. For example, changing a system prompt can make the results a lot worse and finding it out during test time is necessary.
 
 ## Features
 
